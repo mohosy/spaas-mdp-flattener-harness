@@ -1,0 +1,22 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Gradle / Java build output
+processor/build/
+processor/.gradle/
+.gradle/
+
+# macOS
+.DS_Store
+
+# Claude Code session dir
+.claude/
+
+# Local overrides
+docker/.env.local
+*.log
+
+# generated at runtime by make freshness
+demo-api/.freshness.json

@@ -1,0 +1,1 @@
+# Job config (job.yaml, field-mapping.yaml) lands here and is mounted into Flink at /config.

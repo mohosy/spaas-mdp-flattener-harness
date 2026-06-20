@@ -1,0 +1,15 @@
+# Optional observability (profile: observability). Scrapes Flink's Prometheus
+# reporter on JM + TM (port 9249, configured in docker-compose FLINK_PROPERTIES).
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: flink-jobmanager
+    static_configs:
+      - targets: ["flink-jobmanager:9249"]
+        labels: { component: jobmanager }
+  - job_name: flink-taskmanager
+    static_configs:
+      - targets: ["flink-taskmanager:9249"]
+        labels: { component: taskmanager }

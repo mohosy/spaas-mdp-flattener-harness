@@ -1,0 +1,123 @@
+// ===========================================================================
+// SPaaS MDP flattener — self-contained Flink processor module.
+// Builds a shaded fat jar runnable on a vanilla flink:1.20.4 image.
+// Flink CORE is `compileOnly` (provided by the cluster); connectors + Iceberg
+// runtime + Hadoop Configuration + Jackson are bundled.
+//
+// Build (no host Gradle needed):  ../scripts/build-job.sh
+// ===========================================================================
+plugins {
+    id 'java'
+    id 'application'
+    id 'com.gradleup.shadow' version '8.3.5'
+}
+
+apply from: 'versions.gradle'
+
+group = 'com.example.spaas'
+version = '0.1.0'
+
+java {
+    toolchain { languageVersion = JavaLanguageVersion.of(17) }
+}
+
+repositories { mavenCentral() }
+
+// Flink's relocated lz4 (at.yawk.lz4:lz4-java) and Kafka's org.lz4:lz4-java both
+// declare the 'org.lz4:lz4-java' capability -> conflict on the test classpath.
+// Pick the highest version (Flink's, a drop-in net.jpountz.lz4 provider).
+configurations.all {
+    resolutionStrategy.capabilitiesResolution.withCapability('org.lz4:lz4-java') {
+        selectHighestVersion()
+    }
+}
+
+dependencies {
+    // --- Flink core: PROVIDED by the Flink runtime, never bundled ---
+    compileOnly "org.apache.flink:flink-streaming-java:${versions.flink}"
+    compileOnly "org.apache.flink:flink-clients:${versions.flink}"
+    // RowData/GenericRowData/StringData/TimestampData live in flink-table-common;
+    // InternalTypeInfo in flink-table-runtime. Both ship in the Flink dist /lib.
+    compileOnly "org.apache.flink:flink-table-common:${versions.flink}"
+    compileOnly "org.apache.flink:flink-table-runtime:${versions.flink}"
+
+    // --- Bundled into the fat jar ---
+    implementation "org.apache.flink:flink-connector-kafka:${versions.kafkaConnector}"
+    implementation "org.apache.iceberg:iceberg-flink-runtime-1.20:${versions.iceberg}"
+    implementation "org.apache.iceberg:iceberg-aws-bundle:${versions.iceberg}"
+    // org.apache.hadoop.conf.Configuration is REQUIRED by Iceberg CatalogLoader.rest
+    // (even for REST+S3, the API signature demands a Hadoop Configuration). The
+    // vanilla Flink image does not ship Hadoop. These shaded client jars are
+    // self-contained. REMOVE if a future iceberg-flink-runtime bundles Configuration.
+    implementation "org.apache.hadoop:hadoop-client-api:${versions.hadoop}"
+    implementation "org.apache.hadoop:hadoop-client-runtime:${versions.hadoop}"
+    implementation "com.fasterxml.jackson.core:jackson-databind:${versions.jackson}"
+    implementation "org.yaml:snakeyaml:${versions.snakeyaml}"
+
+    // --- Tests ---
+    testImplementation "org.apache.flink:flink-streaming-java:${versions.flink}"
+    testImplementation "org.apache.flink:flink-clients:${versions.flink}"
+    testImplementation "org.apache.flink:flink-table-common:${versions.flink}"
+    testImplementation "org.apache.flink:flink-table-runtime:${versions.flink}"
+    // flink-connector-base (KafkaSource's RecordEmitter etc.) ships in the Flink dist
+    // /lib on a real cluster, so it's not bundled; the in-JVM MiniCluster test needs it.
+    testImplementation "org.apache.flink:flink-connector-base:${versions.flink}"
+    testImplementation "org.junit.jupiter:junit-jupiter:${versions.junit}"
+    testImplementation "org.assertj:assertj-core:${versions.assertj}"
+    testImplementation "org.apache.iceberg:iceberg-core:${versions.iceberg}"
+    testImplementation "org.testcontainers:testcontainers:${versions.testcontainers}"
+    testImplementation "org.testcontainers:junit-jupiter:${versions.testcontainers}"
+    testImplementation "org.testcontainers:kafka:${versions.testcontainers}"
+    testImplementation "org.testcontainers:minio:${versions.testcontainers}"
+    testImplementation "org.awaitility:awaitility:${versions.awaitility}"
+    testRuntimeOnly "org.slf4j:slf4j-simple:${versions.slf4j}"
+}
+
+application {
+    // Default entrypoint = the config-driven flattener. RawEventsJob (M1 skeleton)
+    // is still runnable via `flink run -c com.example.spaas.job.RawEventsJob`.
+    mainClass = 'com.example.spaas.job.FlattenerJob'
+}
+
+test {
+    useJUnitPlatform {
+        // Default `gradle test` runs fast unit tests. The Testcontainers
+        // end-to-end test is tagged 'integration' and run with -Pintegration.
+        if (!project.hasProperty('integration')) {
+            excludeTags 'integration'
+        }
+    }
+    // Flink on JDK 17 needs these module opens for its reflective serialization during
+    // checkpointing. The real Flink dist sets them via env.java.opts; the in-JVM
+    // MiniCluster test must set them itself or checkpoints (and Iceberg commits) fail.
+    jvmArgs(
+        '--add-opens=java.base/java.util=ALL-UNNAMED',
+        '--add-opens=java.base/java.lang=ALL-UNNAMED',
+        '--add-opens=java.base/java.lang.reflect=ALL-UNNAMED',
+        '--add-opens=java.base/java.io=ALL-UNNAMED',
+        '--add-opens=java.base/java.net=ALL-UNNAMED',
+        '--add-opens=java.base/java.nio=ALL-UNNAMED',
+        '--add-opens=java.base/java.util.concurrent=ALL-UNNAMED',
+        '--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED',
+        '--add-opens=java.base/java.lang.invoke=ALL-UNNAMED',
+        '--add-opens=java.base/java.time=ALL-UNNAMED',
+        '--add-opens=java.base/sun.nio.ch=ALL-UNNAMED'
+    )
+    testLogging { events 'passed', 'skipped', 'failed'; exceptionFormat 'full'; showStandardStreams = true }
+}
+
+shadowJar {
+    archiveBaseName = 'spaas-processor'
+    archiveClassifier = ''
+    archiveVersion = ''
+    // Hadoop client + AWS bundle push the jar past 65535 entries -> needs zip64.
+    zip64 = true
+    mergeServiceFiles()
+    exclude 'META-INF/*.SF'
+    exclude 'META-INF/*.DSA'
+    exclude 'META-INF/*.RSA'
+    // Flink and Iceberg both relocate Jackson internally; our app Jackson is bundled
+    // un-relocated which is fine because user-code runs in Flink's child classloader.
+}
+
+tasks.named('build') { dependsOn 'shadowJar' }

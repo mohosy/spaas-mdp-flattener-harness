@@ -1,0 +1,46 @@
+{
+  "uid": "spaas-flink",
+  "title": "SPaaS MDP Flattener — Flink",
+  "tags": ["spaas", "flink"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Running jobs",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "expr": "max(flink_jobmanager_numRunningJobs)", "refId": "A" } ]
+    },
+    {
+      "id": 2, "type": "stat", "title": "Completed checkpoints",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "expr": "max(flink_jobmanager_job_numberOfCompletedCheckpoints)", "refId": "A" } ]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Last checkpoint duration (ms)",
+      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "expr": "max(flink_jobmanager_job_lastCheckpointDuration)", "refId": "A" } ]
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "Records out / sec (throughput)",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [ { "expr": "sum(rate(flink_taskmanager_job_task_numRecordsOut[1m]))", "refId": "A", "legendFormat": "records/s" } ]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Total records in / out",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(flink_taskmanager_job_task_numRecordsIn)", "refId": "A", "legendFormat": "in" },
+        { "expr": "sum(flink_taskmanager_job_task_numRecordsOut)", "refId": "B", "legendFormat": "out" }
+      ]
+    }
+  ]
+}

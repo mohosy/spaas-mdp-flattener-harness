@@ -1,0 +1,50 @@
+# ###########################################################################
+# ##  REPLACE WITH REAL SCHEMA                                             ##
+# ###########################################################################
+# This is the ONE place the manufacturing event shape is defined. It maps the
+# synthetic `mdp.mfg.v1` placeholder envelope/event to the flattened business
+# columns. When the real `testMeasurementEvent` is gathered, edit THIS FILE
+# (envelope keys, per-column event keys, and required_fields). No Flink/Java
+# pipeline code changes — the flattener is driven entirely by this mapping.
+#
+# TODO: confirm with mentors — real envelope/event field names, the real
+# required-field set, and the real topic name.
+# ###########################################################################
+
+envelope:
+  message_id: messageId         # envelope -> message_id business column
+  schema_version: schemaVersion # envelope -> schema_version business column
+  events_array: events          # JSON array field holding the per-test events
+
+# business_column: json_field_name_within_each_event
+event:
+  event_id: eventId
+  test_station_id: testStationId
+  product_model: productModel
+  product_serial: productSerial
+  test_program: testProgram
+  test_session_id: testSessionId
+  operator_id: operatorId
+  measurement_name: measurementName
+  measurement_value: measurementValue
+  measurement_unit: measurementUnit
+  lower_limit: lowerLimit
+  upper_limit: upperLimit
+  result: result
+  measured_at: measuredAt
+
+# Required fields for a VALID event (by JSON name). Missing or null -> quarantine.
+required_fields:
+  - eventId
+  - productSerial
+  - measurementName
+  - measurementValue
+  - measuredAt
+
+# Columns parsed as numeric doubles (others are strings; *_at are timestamps).
+numeric_fields:
+  - measurement_value
+  - lower_limit
+  - upper_limit
+timestamp_fields:
+  - measured_at

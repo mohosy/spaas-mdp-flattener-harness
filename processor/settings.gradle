@@ -1,0 +1,4 @@
+// Self-contained module. When lifting into a Java 17 Gradle multi-project repo,
+// move this to `include 'processor'` in the parent settings.gradle and keep
+// versions.gradle as the single source of dependency versions.
+rootProject.name = 'spaas-processor'

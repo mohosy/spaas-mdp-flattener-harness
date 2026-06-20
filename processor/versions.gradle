@@ -1,0 +1,21 @@
+// ===========================================================================
+// SINGLE SOURCE OF TRUTH for all Java/Gradle dependency versions.
+// Confirmed against Maven Central on 2026-06-19 (see ../NOTES.md).
+// The Iceberg Flink runtime suffix (-1.20) MUST match the Flink minor version.
+//
+// TODO: confirm with mentors — production Flink/Iceberg target is unconfirmed
+// (prod repo mixes 1.19 and 2.x). Harness standardizes on Flink 1.20.4.
+// ===========================================================================
+ext.versions = [
+    flink           : '1.20.4',
+    kafkaConnector  : '3.4.0-1.20',   // org.apache.flink:flink-connector-kafka
+    iceberg         : '1.10.1',       // lib + iceberg-flink-runtime-1.20 + iceberg-aws-bundle
+    hadoop          : '3.4.1',        // only org.apache.hadoop.conf.Configuration is needed at runtime
+    jackson         : '2.18.2',
+    snakeyaml       : '2.3',
+    slf4j           : '2.0.16',
+    junit           : '5.11.3',
+    assertj         : '3.26.3',
+    testcontainers  : '1.20.4',
+    awaitility      : '4.2.2',
+]

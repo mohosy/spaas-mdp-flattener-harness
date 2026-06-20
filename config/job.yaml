@@ -1,0 +1,37 @@
+# ===========================================================================
+# SINGLE job config. Selects source, transform, sinks (flattened/quarantine/
+# audit), Iceberg target, and runtime metadata. Validated on startup by
+# com.example.spaas.config.JobConfig. Mounted into Flink at /config/job.yaml.
+#
+# Manufacturing-SCHEMA specifics are NOT here — they live in field-mapping.yaml
+# (the REPLACE WITH REAL SCHEMA file) so the real event shape is a config swap.
+# ===========================================================================
+
+processor:
+  version: "0.2.0-mdp"          # -> processor_version lineage column
+
+source:
+  type: kafka                   # connector contract: kafka
+  bootstrap_servers: "kafka:9092"
+  topic: "mdp.mfg.raw"
+  group_id: "spaas-mdp-flattener"
+  startup_mode: earliest        # earliest | latest
+
+transform:
+  type: mdp_flatten             # selects MdpFlattener; a new transform = new type
+  mapping_file: "/config/field-mapping.yaml"
+
+iceberg:
+  rest_uri: "http://iceberg-rest:8181"
+  warehouse: "s3://warehouse/"
+  s3_endpoint: "http://minio:9000"
+  region: "us-east-1"
+
+sinks:
+  flattened: "mdp.flattened_measurements"
+  quarantine: "mdp.quarantine"
+  audit: "mdp.audit"
+
+runtime:
+  checkpoint_ms: 10000          # Iceberg commits on checkpoint -> visibility cadence
+  parallelism: 1                # single writer per table (hard constraint)
