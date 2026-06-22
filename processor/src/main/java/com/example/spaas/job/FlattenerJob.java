@@ -11,11 +11,17 @@ import com.example.spaas.transform.mdp.MdpFieldMapping;
 import com.example.spaas.transform.mdp.MdpFlattener;
 
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.state.CheckpointListener;
+import org.apache.flink.api.common.state.ListState;
+import org.apache.flink.api.common.state.ListStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializationSchema;
+import org.apache.flink.runtime.state.FunctionInitializationContext;
+import org.apache.flink.runtime.state.FunctionSnapshotContext;
+import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -35,7 +41,10 @@ import org.apache.iceberg.flink.sink.FlinkSink;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.UUID;
@@ -46,7 +55,7 @@ import java.util.UUID;
  * Pipeline: Kafka -&gt; keyBy(constant) -&gt; FlattenProcess -&gt; three Iceberg sinks:
  *   main output      -&gt; mdp.flattened_measurements
  *   QUARANTINE side  -&gt; mdp.quarantine
- *   AUDIT side       -&gt; mdp.audit  (one row per audit window via processing-time timer)
+ *   AUDIT side       -&gt; mdp.audit  (one row per Iceberg commit, flushed by a timer)
  *
  * Everything is selected by config/job.yaml + field-mapping.yaml. Single writer per
  * table (parallelism 1) is enforced by JobConfig.
@@ -160,58 +169,93 @@ public final class FlattenerJob {
     }
 
     /**
-     * Flattens each message, routes quarantine to a side output, and emits a periodic
-     * audit record (one per checkpoint-interval window) to the audit side output.
+     * Flattens each message, routes quarantine to a side output, and emits one audit row
+     * per Iceberg commit to the audit side output.
      *
-     * Counters are per-window instance state (reset each audit emit). They are NOT in
-     * Flink keyed state, so on restart auditing simply begins a fresh window — the
-     * flattened data itself is exactly-/at-least-once via the Iceberg sink + checkpoints.
+     * The audit window is designed around two Flink rules: a function may not emit records
+     * from snapshotState or notifyCheckpointComplete, and a bounded input (produced once,
+     * then idle) must still flush an audit row. The mechanism, in four steps:
+     * <ol>
+     *   <li>processElement accumulates the running counters into transient working fields.</li>
+     *   <li>snapshotState seals those counters into a pending audit window tagged with this
+     *       checkpoint id, then resets the running fields. The window holds exactly the
+     *       records the Iceberg sink commits for this checkpoint. Sealed windows are written
+     *       to operator managed state (a ListState), so the counters survive a checkpoint and
+     *       a restart. The running fields are transient on purpose: a restart rewinds the
+     *       Kafka source and reprocesses the records after the last checkpoint, so persisting
+     *       a partial window would double count it. This is the standard operator state
+     *       pattern (a working copy synced to managed state at each checkpoint).</li>
+     *   <li>notifyCheckpointComplete records the highest completed checkpoint id. The Iceberg
+     *       commit for that checkpoint has now landed, so its snapshot id is readable.</li>
+     *   <li>a processing time timer (armed by the first element, re-registered on every fire)
+     *       emits each pending window whose checkpoint has completed, stamped with the
+     *       committed snapshot id. Emitting from the timer rather than from the next element
+     *       is what keeps a bounded run from starving: the timer keeps firing on wall clock
+     *       even when no new element arrives, so the last sealed window is still written.</li>
+     * </ol>
+     * Parallelism is fixed at 1 (single writer per table), so the constant keyBy and the
+     * operator state both describe one logical writer; the constant key exists only so this
+     * function can register the flush timer. Flattened data is exactly once via the Iceberg
+     * sink; audit rows are at least once (a window may repeat if the job restarts before the
+     * next checkpoint trims the emitted entry from managed state).
      */
     static final class FlattenProcess
-            extends KeyedProcessFunction<Integer, RawMessage, RowData> {
+            extends KeyedProcessFunction<Integer, RawMessage, RowData>
+            implements CheckpointedFunction, CheckpointListener {
         private static final long serialVersionUID = 1L;
 
         private final MdpFieldMapping mapping;
         private final String processorVersion;
         private final String topic;
-        private final long auditIntervalMs;
+        private final long flushIntervalMs;
         private final Map<String, String> catalogProps;
         private final String flattenedTable;
 
         private transient MdpFlattener flattener;
         private transient String runId;
         private transient boolean timerArmed;
+        // Running window: counters accumulated since the last checkpoint. Working copy that
+        // is sealed into managed state at each checkpoint (see class Javadoc).
         private transient long inputEvents;
         private transient long outputRows;
         private transient long quarantineCnt;
         private transient long dedupDropped;
         private transient TreeMap<Integer, long[]> partOffsets; // partition -> [min,max]
+        // Sealed windows awaiting emit. The in-memory list is the working copy; pendingState
+        // is the managed state it is synced to at each checkpoint and restored from on start.
+        private transient List<AuditWindow> pending;
+        private transient ListState<AuditWindow> pendingState;
+        private transient long lastCompletedCheckpointId;
         private transient Catalog catalog;
 
         FlattenProcess(MdpFieldMapping mapping, String processorVersion, String topic,
-                       long auditIntervalMs, Map<String, String> catalogProps, String flattenedTable) {
+                       long flushIntervalMs, Map<String, String> catalogProps, String flattenedTable) {
             this.mapping = mapping;
             this.processorVersion = processorVersion;
             this.topic = topic;
-            this.auditIntervalMs = auditIntervalMs;
+            this.flushIntervalMs = flushIntervalMs;
             this.catalogProps = catalogProps;
             this.flattenedTable = flattenedTable;
         }
 
-        private void lazyInit() {
-            if (flattener == null) {
-                flattener = new MdpFlattener(mapping, processorVersion);
-                runId = UUID.randomUUID().toString();
-                partOffsets = new TreeMap<>();
+        @Override
+        public void initializeState(FunctionInitializationContext ctx) throws Exception {
+            flattener = new MdpFlattener(mapping, processorVersion);
+            runId = UUID.randomUUID().toString();
+            partOffsets = new TreeMap<>();
+            pendingState = ctx.getOperatorStateStore().getListState(
+                    new ListStateDescriptor<>("audit-pending", TypeInformation.of(AuditWindow.class)));
+            pending = new ArrayList<>();
+            for (AuditWindow w : pendingState.get()) {   // restore windows sealed before a restart
+                pending.add(w);
             }
         }
 
         @Override
         public void processElement(RawMessage msg, Context ctx, Collector<RowData> out) {
-            lazyInit();
             if (!timerArmed) {
                 ctx.timerService().registerProcessingTimeTimer(
-                        ctx.timerService().currentProcessingTime() + auditIntervalMs);
+                        ctx.timerService().currentProcessingTime() + flushIntervalMs);
                 timerArmed = true;
             }
 
@@ -234,18 +278,56 @@ public final class FlattenerJob {
 
         @Override
         public void onTimer(long ts, OnTimerContext ctx, Collector<RowData> out) {
+            emitCompletedWindows(ctx);
+            ctx.timerService().registerProcessingTimeTimer(ts + flushIntervalMs);
+        }
+
+        @Override
+        public void snapshotState(FunctionSnapshotContext ctx) throws Exception {
+            // Seal the records gathered since the last checkpoint into one window tagged with
+            // this checkpoint id; the Iceberg sink commits these same records when this
+            // checkpoint completes. Empty windows are skipped so audit has no blank rows.
             if (inputEvents > 0 || quarantineCnt > 0) {
-                ctx.output(AUDIT_TAG, AuditSchema.toRowData(
-                        runId, processorVersion, topic, partitionOffsetsJson(),
-                        inputEvents, outputRows, quarantineCnt, dedupDropped,
-                        Instant.now(), trySnapshotId()));
-                inputEvents = 0;
-                outputRows = 0;
-                quarantineCnt = 0;
-                dedupDropped = 0;
-                partOffsets.clear();
+                pending.add(new AuditWindow(runId, inputEvents, outputRows, quarantineCnt,
+                        dedupDropped, partitionOffsetsJson(), ctx.getCheckpointId()));
+                resetRunningWindow();
             }
-            ctx.timerService().registerProcessingTimeTimer(ts + auditIntervalMs);
+            pendingState.update(pending);   // single point where the pending list is persisted
+        }
+
+        @Override
+        public void notifyCheckpointComplete(long checkpointId) {
+            // The Iceberg commit for this checkpoint has landed, so its snapshot id is now
+            // readable. The flush timer emits pending windows up to this checkpoint id.
+            lastCompletedCheckpointId = Math.max(lastCompletedCheckpointId, checkpointId);
+        }
+
+        /** Emits each pending window whose checkpoint has committed, with that snapshot id. */
+        private void emitCompletedWindows(OnTimerContext ctx) {
+            if (pending.isEmpty()) {
+                return;
+            }
+            Long snapshotId = trySnapshotId();   // committed snapshot of the flattened table
+            Iterator<AuditWindow> it = pending.iterator();
+            while (it.hasNext()) {
+                AuditWindow w = it.next();
+                if (w.checkpointId > lastCompletedCheckpointId) {
+                    continue;   // its Iceberg commit has not completed yet; a later timer emits it
+                }
+                ctx.output(AUDIT_TAG, AuditSchema.toRowData(
+                        w.runId, processorVersion, topic, w.partitionOffsetsJson,
+                        w.inputEvents, w.outputRows, w.quarantineCnt, w.dedupDropped,
+                        Instant.now(), snapshotId));
+                it.remove();
+            }
+        }
+
+        private void resetRunningWindow() {
+            inputEvents = 0;
+            outputRows = 0;
+            quarantineCnt = 0;
+            dedupDropped = 0;
+            partOffsets = new TreeMap<>();
         }
 
         private String partitionOffsetsJson() {
@@ -273,6 +355,35 @@ public final class FlattenerJob {
             } catch (Exception e) {
                 return null;
             }
+        }
+    }
+
+    /**
+     * One sealed audit window awaiting emit: the counters gathered for a single checkpoint,
+     * the per partition offset range as JSON, and the checkpoint id that sealed it. A Flink
+     * POJO (public no arg constructor, public fields) so operator state stores it with the
+     * POJO serializer rather than with Kryo.
+     */
+    public static final class AuditWindow {
+        public String runId;
+        public long inputEvents;
+        public long outputRows;
+        public long quarantineCnt;
+        public long dedupDropped;
+        public String partitionOffsetsJson;
+        public long checkpointId;
+
+        public AuditWindow() {}
+
+        AuditWindow(String runId, long inputEvents, long outputRows, long quarantineCnt,
+                    long dedupDropped, String partitionOffsetsJson, long checkpointId) {
+            this.runId = runId;
+            this.inputEvents = inputEvents;
+            this.outputRows = outputRows;
+            this.quarantineCnt = quarantineCnt;
+            this.dedupDropped = dedupDropped;
+            this.partitionOffsetsJson = partitionOffsetsJson;
+            this.checkpointId = checkpointId;
         }
     }
 }

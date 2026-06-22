@@ -236,6 +236,49 @@ architecture diagram + production-mapping table, and a labeled
 
 ---
 
+## M7 — Real MDP operations + durable, commit aligned audit  ✅ PASS (2026-06-22)
+
+Two changes on top of the M2 flattener, both config driven and covered by tests.
+
+**Four flatten operations (in `field-mapping.yaml`).** The mapping now supports four derived
+column shapes taken from the production dbt model, alongside the existing direct mapping:
+1. fallback chain (coalesce): the first source that is present and not null wins, else null.
+2. array reduce: MAX or MIN over the numeric values of named entries (UL, LL) inside an array
+   of {name, value} objects, comparing the name ignoring case and skipping values that are
+   not numbers; a single match returns that value.
+3. numeric and string split: one source string goes to a numeric column when it parses as a
+   decimal, otherwise to a string column (a text value is kept, never quarantined).
+4. multi format timestamp: the first accepted format wins (ISO 8601, then `MM/dd/yyyy`, then
+   `yyyy-MM-dd`), else null; an unparseable value is nulled, not quarantined.
+Operations are typed, self validating records (`MdpOperation`), so a misconfigured mapping
+fails fast on load. `defaultSynthetic()` and `config/field-mapping.yaml` each carry one clear
+example. The examples reference real MDP fields the synthetic generator does not emit, so the
+live flattened table is unchanged; the operations are proven by unit tests on the output map.
+
+**Durable, commit aligned audit window (`FlattenerJob`).** The audit counters (input, output,
+quarantine, dedup, and per partition offset min and max) now live in Flink operator managed
+state rather than in plain transient fields. processElement accumulates a running window;
+snapshotState seals it into a pending window tagged with the checkpoint id and writes the
+pending list to a ListState, so the counts survive a checkpoint and a restart;
+notifyCheckpointComplete records the completed checkpoint id; a processing time timer emits
+each pending window whose checkpoint has committed, stamped with the committed Iceberg
+snapshot id. Emission runs from the timer (not from the next element), so a bounded run that
+produces once and then waits still writes its audit row. The running window resets at each
+checkpoint on purpose: a restart rewinds the Kafka source and reprocesses those records, so
+persisting a partial window would double count. Flattened data stays exactly once; audit rows
+are at least once.
+
+Verification:
+```
+$ bash scripts/test.sh             -> 29 unit PASS (Hashing 4, MdpFieldMapping 6, MdpFlattener 19)
+$ bash scripts/test.sh integration -> [IT] FINAL flattened=7 quarantine=2 audit=1   PASSED
+  IcebergFilesCommitter committed flattened_measurements + quarantine at checkpointId 1,
+  and audit at checkpointId 2: a window is sealed at its checkpoint, emitted after that
+  checkpoint completes, and committed on the next one (audit lags one commit, by design).
+```
+
+---
+
 ## Summary
 
 All milestones M0–M6 verified end to end on the live stack, plus a 12-test suite
