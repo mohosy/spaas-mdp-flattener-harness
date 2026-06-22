@@ -9,11 +9,15 @@ import com.example.spaas.api.TransformResult;
 import com.example.spaas.lineage.Hashing;
 
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -127,7 +131,12 @@ public final class MdpFlattener implements Transform {
         return new TransformResult(rows, quarantine, inputEventCount, dedupDropped);
     }
 
-    /** Builds the 16 business columns. Throws on invalid numeric/timestamp values. */
+    /**
+     * Builds the business columns: first the direct columns, then any derived columns.
+     * Direct numeric/timestamp columns throw on an invalid value (the existing strict
+     * behavior, which routes the event to quarantine). The derived operations never throw;
+     * they fall back to null or to a string, as each operation's contract requires.
+     */
     private Map<String, Object> buildBusiness(String messageId, String schemaVersion, JsonNode ev) {
         Map<String, Object> b = new LinkedHashMap<>();
         b.put("message_id", messageId);
@@ -137,7 +146,131 @@ public final class MdpFlattener implements Transform {
             JsonNode node = ev.get(e.getValue());
             b.put(col, convert(col, node));
         }
+        for (MdpOperation op : mapping.operations) {
+            applyOperation(op, ev, b);
+        }
         return b;
+    }
+
+    /** Dispatches one derived column rule to its implementation, writing into the row. */
+    private void applyOperation(MdpOperation op, JsonNode ev, Map<String, Object> b) {
+        if (op instanceof FallbackOp f) {
+            b.put(f.column(), fallback(f, ev));
+        } else if (op instanceof ArrayReduceOp a) {
+            b.put(a.column(), arrayReduce(a, ev));
+        } else if (op instanceof NumericStringSplitOp s) {
+            numericStringSplit(s, ev, b);
+        } else if (op instanceof MultiFormatTimestampOp t) {
+            b.put(t.column(), multiFormatTimestamp(t, ev));
+        } else {
+            throw new IllegalStateException("unknown operation type: " + op.getClass());
+        }
+    }
+
+    /** Returns the first source field that is present and not null (as text), else null. */
+    private static Object fallback(FallbackOp op, JsonNode ev) {
+        for (String source : op.sources()) {
+            JsonNode n = ev.get(source);
+            if (n != null && !n.isNull()) {
+                return n.asText();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * MAX or MIN over the numeric values of the array elements whose name matches the
+     * target token (ignoring case). Values that are not numbers are skipped. Returns null
+     * when nothing matches or nothing parses; with one match it returns that single value,
+     * because the accumulator starts empty (null) and only then takes a value.
+     */
+    private static Object arrayReduce(ArrayReduceOp op, JsonNode ev) {
+        JsonNode array = ev.get(op.arrayField());
+        if (array == null || !array.isArray()) {
+            return null;
+        }
+        Double acc = null;   // empty accumulator: the first kept value becomes the result
+        for (JsonNode element : array) {
+            JsonNode nameNode = element.get(op.nameKey());
+            if (nameNode == null || !nameNode.asText().equalsIgnoreCase(op.matchToken())) {
+                continue;
+            }
+            Double value = parseDecimalOrNull(textOf(element.get(op.valueKey())));
+            if (value == null) {
+                continue;   // skip a matched element whose value is not a number
+            }
+            acc = (acc == null) ? value
+                    : (op.reduce() == ReduceKind.MAX ? Math.max(acc, value) : Math.min(acc, value));
+        }
+        return acc;
+    }
+
+    /**
+     * Routes one source value to either the numeric column or the string column. A value
+     * that parses as a decimal goes to the numeric column; otherwise the original text goes
+     * to the string column. A present but non numeric value is kept as text, never
+     * quarantined. A missing source leaves both columns null.
+     */
+    private static void numericStringSplit(NumericStringSplitOp op, JsonNode ev, Map<String, Object> b) {
+        String text = textOf(ev.get(op.sourceField()));
+        Double numeric = parseDecimalOrNull(text);
+        b.put(op.numericColumn(), numeric);
+        b.put(op.stringColumn(), numeric == null ? text : null);
+    }
+
+    /**
+     * Parses the source string with the first accepted format that matches, else null. A
+     * present but unparseable value is nulled rather than quarantined, matching the source
+     * model behavior for optional timestamps.
+     */
+    private static Object multiFormatTimestamp(MultiFormatTimestampOp op, JsonNode ev) {
+        String text = textOf(ev.get(op.sourceField()));
+        if (text == null) {
+            return null;
+        }
+        for (String format : op.formats()) {
+            Instant parsed = tryTimestamp(format, text);
+            if (parsed != null) {
+                return parsed;
+            }
+        }
+        return null;
+    }
+
+    /** Tries one timestamp format, returning null if the text does not match it. */
+    private static Instant tryTimestamp(String format, String text) {
+        try {
+            if (MdpOperation.ISO_8601.equalsIgnoreCase(format)) {
+                try {
+                    return Instant.parse(text);                     // e.g. 2026-06-19T10:00:00.050Z
+                } catch (Exception notInstant) {
+                    return OffsetDateTime.parse(text).toInstant();  // e.g. ...+01:00
+                }
+            }
+            // Any other format is a calendar date pattern, read at midnight UTC. This matches
+            // the date only secondary formats the source model uses (for example MM/dd/yyyy).
+            LocalDate date = LocalDate.parse(text, DateTimeFormatter.ofPattern(format, Locale.ROOT));
+            return date.atStartOfDay(ZoneOffset.UTC).toInstant();
+        } catch (Exception notThisFormat) {
+            return null;
+        }
+    }
+
+    /** Null-safe text of a JSON node: null for a missing or JSON-null node. */
+    private static String textOf(JsonNode node) {
+        return (node == null || node.isNull()) ? null : node.asText();
+    }
+
+    /** Parses text as a decimal, returning null (not an exception) when it is not a number. */
+    private static Double parseDecimalOrNull(String text) {
+        if (text == null) {
+            return null;
+        }
+        try {
+            return Double.parseDouble(text.trim());
+        } catch (NumberFormatException nfe) {
+            return null;
+        }
     }
 
     private Object convert(String column, JsonNode node) {

@@ -48,3 +48,50 @@ numeric_fields:
   - upper_limit
 timestamp_fields:
   - measured_at
+
+# ---------------------------------------------------------------------------
+# Derived columns: business columns computed by an operation rather than copied
+# from a single event field. This section is optional. Each entry names its
+# operation with `op`. The four operations below are the shapes the production
+# MDP model needs. The example source fields (instrumentId, testSpecAttributes,
+# measurementResult, calibratedAt) are not produced by the synthetic generator,
+# so on the synthetic path these columns are null and the live flattened table
+# is unchanged; they exist here to document the format and are proven by tests.
+# ---------------------------------------------------------------------------
+derived:
+  # 1) FALLBACK CHAIN (coalesce): first source that is present and not null wins.
+  - op: fallback
+    column: product_identity
+    sources: [instrumentId, accessoryId, subAssemblyId]
+
+  # 2) ARRAY REDUCE: pick named entries from an array of {name, value} objects and
+  #    collapse their numeric values. Used for the upper (UL, max) and lower
+  #    (LL, min) limits, which live inside the test specification attributes array.
+  - op: array_reduce
+    column: spec_upper_limit
+    source_array: testSpecAttributes
+    match: UL
+    reduce: max
+    name_key: name        # optional, defaults to: name
+    value_key: value      # optional, defaults to: value
+  - op: array_reduce
+    column: spec_lower_limit
+    source_array: testSpecAttributes
+    match: LL
+    reduce: min
+
+  # 3) NUMERIC AND STRING SPLIT: one source string yields a numeric column when it
+  #    parses as a decimal, otherwise the original text in the string column. A non
+  #    numeric value is kept as text, never quarantined.
+  - op: numeric_string_split
+    source: measurementResult
+    numeric_column: measurement_result_numeric
+    string_column: measurement_result_text
+
+  # 4) MULTI FORMAT TIMESTAMP: first matching format wins, else null. The token
+  #    ISO_8601 matches an ISO 8601 instant or offset; other entries are calendar
+  #    date patterns read at midnight UTC.
+  - op: multi_format_timestamp
+    column: calibrated_at
+    source: calibratedAt
+    formats: [ISO_8601, "MM/dd/yyyy", "yyyy-MM-dd"]

@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -128,5 +129,124 @@ class MdpFlattenerTest {
         assertThat(r.flattenedRows).isEmpty();
         assertThat(r.quarantined).hasSize(1);
         assertThat(r.quarantined.get(0).errorReason).isEqualTo(QuarantineRecord.Reason.INVALID_FIELD_VALUE);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Derived columns: the four operations defined in MdpFieldMapping.defaultSynthetic().
+    // Each test feeds an otherwise valid event that also carries the operation's source
+    // fields, then asserts the single flattened row's derived columns.
+    // ---------------------------------------------------------------------------------
+
+    /** A valid event (passes the required fields) plus the given extra JSON members. */
+    private String eventWithExtras(String extraJson) {
+        String base = "\"eventId\":\"e1\",\"productSerial\":\"SN-1\","
+                + "\"measurementName\":\"torque\",\"measurementValue\":12.0,"
+                + "\"measuredAt\":\"2026-06-19T10:00:00.050Z\"";
+        return "{" + base + (extraJson.isBlank() ? "" : "," + extraJson) + "}";
+    }
+
+    /** Flattens one valid event carrying the extra fields and returns its single row. */
+    private Map<String, Object> rowWithExtras(String extraJson) {
+        TransformResult r = flattener().apply(msg(envelope("m1", eventWithExtras(extraJson)), 0, 0));
+        assertThat(r.quarantined).isEmpty();
+        assertThat(r.flattenedRows).hasSize(1);
+        return r.flattenedRows.get(0);
+    }
+
+    @Test
+    void fallbackChain_takesFirstPresentSource() {
+        // instrument present -> wins over later candidates
+        assertThat(rowWithExtras("\"instrumentId\":\"INS-1\",\"accessoryId\":\"ACC-2\"")
+                .get("product_identity")).isEqualTo("INS-1");
+    }
+
+    @Test
+    void fallbackChain_fallsThroughNullAndMissingToLaterSource() {
+        // instrument is JSON null, accessory missing, sub assembly present -> third wins
+        assertThat(rowWithExtras("\"instrumentId\":null,\"subAssemblyId\":\"SUB-3\"")
+                .get("product_identity")).isEqualTo("SUB-3");
+    }
+
+    @Test
+    void fallbackChain_allCandidatesNull_isNull() {
+        // none of instrumentId/accessoryId/subAssemblyId present
+        assertThat(rowWithExtras("").get("product_identity")).isNull();
+    }
+
+    @Test
+    void arrayReduce_maxAndMin_overNamedEntries() {
+        Map<String, Object> row = rowWithExtras("\"testSpecAttributes\":["
+                + "{\"name\":\"UL\",\"value\":\"15.0\"},{\"name\":\"UL\",\"value\":\"16.5\"},"
+                + "{\"name\":\"LL\",\"value\":\"9.0\"}]");
+        assertThat(row.get("spec_upper_limit")).isEqualTo(16.5);   // MAX of the UL entries
+        assertThat(row.get("spec_lower_limit")).isEqualTo(9.0);    // MIN of the LL entries
+    }
+
+    @Test
+    void arrayReduce_skipsNonNumericValues() {
+        Map<String, Object> row = rowWithExtras("\"testSpecAttributes\":["
+                + "{\"name\":\"UL\",\"value\":\"abc\"},{\"name\":\"UL\",\"value\":\"16.5\"}]");
+        assertThat(row.get("spec_upper_limit")).isEqualTo(16.5);   // "abc" skipped, not quarantined
+    }
+
+    @Test
+    void arrayReduce_singleMatch_caseInsensitive_returnsThatValue() {
+        // lower case name still matches "UL"; one value must come back, not null
+        Map<String, Object> row = rowWithExtras(
+                "\"testSpecAttributes\":[{\"name\":\"ul\",\"value\":\"12.5\"}]");
+        assertThat(row.get("spec_upper_limit")).isEqualTo(12.5);
+    }
+
+    @Test
+    void arrayReduce_noMatchingElement_isNull() {
+        Map<String, Object> row = rowWithExtras(
+                "\"testSpecAttributes\":[{\"name\":\"OTHER\",\"value\":\"1.0\"}]");
+        assertThat(row.get("spec_upper_limit")).isNull();
+        assertThat(row.get("spec_lower_limit")).isNull();
+    }
+
+    @Test
+    void numericStringSplit_numericValue_goesToNumericColumn() {
+        Map<String, Object> row = rowWithExtras("\"measurementResult\":\"12.5\"");
+        assertThat(row.get("measurement_result_numeric")).isEqualTo(12.5);
+        assertThat(row.get("measurement_result_text")).isNull();
+    }
+
+    @Test
+    void numericStringSplit_textValue_goesToStringColumn_notQuarantined() {
+        Map<String, Object> row = rowWithExtras("\"measurementResult\":\"RETEST\"");
+        assertThat(row.get("measurement_result_numeric")).isNull();
+        assertThat(row.get("measurement_result_text")).isEqualTo("RETEST");
+    }
+
+    @Test
+    void multiFormatTimestamp_parsesEachAcceptedFormat() {
+        // ISO 8601 instant
+        assertThat(rowWithExtras("\"calibratedAt\":\"2026-06-19T10:00:00.050Z\"").get("calibrated_at"))
+                .isEqualTo(Instant.parse("2026-06-19T10:00:00.050Z"));
+        // MM/dd/yyyy, read at midnight UTC
+        assertThat(rowWithExtras("\"calibratedAt\":\"06/19/2026\"").get("calibrated_at"))
+                .isEqualTo(Instant.parse("2026-06-19T00:00:00Z"));
+        // yyyy-MM-dd, read at midnight UTC
+        assertThat(rowWithExtras("\"calibratedAt\":\"2026-06-19\"").get("calibrated_at"))
+                .isEqualTo(Instant.parse("2026-06-19T00:00:00Z"));
+    }
+
+    @Test
+    void multiFormatTimestamp_unparseableValue_isNull() {
+        assertThat(rowWithExtras("\"calibratedAt\":\"not-a-date\"").get("calibrated_at")).isNull();
+    }
+
+    @Test
+    void derivedColumns_areDeterministic() {
+        String extras = "\"instrumentId\":\"INS-1\",\"measurementResult\":\"7.25\","
+                + "\"calibratedAt\":\"06/19/2026\",\"testSpecAttributes\":["
+                + "{\"name\":\"UL\",\"value\":\"16.5\"},{\"name\":\"LL\",\"value\":\"9.0\"}]";
+        Map<String, Object> a = rowWithExtras(extras);
+        Map<String, Object> b = rowWithExtras(extras);
+        for (String col : List.of("product_identity", "spec_upper_limit", "spec_lower_limit",
+                "measurement_result_numeric", "calibrated_at", "canonical_row_hash")) {
+            assertThat(a.get(col)).as(col).isEqualTo(b.get(col));
+        }
     }
 }
