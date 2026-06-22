@@ -279,6 +279,26 @@ $ bash scripts/test.sh integration -> [IT] FINAL flattened=7 quarantine=2 audit=
 
 ---
 
+## M8 — Freshness cadence and probe accuracy  ✅ (2026-06-22)
+
+Two small changes, code and config only (not re-measured on the live stack this session; M5
+holds the last measured numbers).
+
+**Commit cadence.** `runtime.checkpoint_ms` in `config/job.yaml` is now 5000 (from 10000).
+Because almost all end to end latency is the wait for the next Iceberg commit, a commit
+interval near 5 seconds holds P95 freshness under 10 seconds. The comment there records the
+tradeoff: a shorter interval lands data sooner but writes more, smaller files, and the file
+compaction and table maintenance that follow belong to the team that owns the sink tables, not
+to this processor.
+
+**Probe accuracy.** `scripts/freshness.py` recorded the produce time right after
+producer.produce(), which only enqueues the message into the local buffer; the broker append
+happens at flush, so the timestamps clustered and the percentiles understated latency. The
+produce time is now recorded in the delivery report callback, the moment the broker
+acknowledges the send, so latency starts when the message is actually sent.
+
+---
+
 ## Summary
 
 All milestones M0–M6 verified end to end on the live stack, plus a 12-test suite

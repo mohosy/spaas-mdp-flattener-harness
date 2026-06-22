@@ -2,9 +2,9 @@
 """
 End-to-end freshness probe: Kafka -> Flink -> Iceberg -> queryable-in-Trino.
 
-Produces a burst of uniquely-tagged events, records each event's produce time,
-then polls Trino until each event is visible in mdp.flattened_measurements,
-recording first-visible wall-clock time. Latency = visible_time - produced_time.
+Produces a burst of uniquely-tagged events, records when the broker acknowledges
+each send, then polls Trino until each event is visible in mdp.flattened_measurements,
+recording first-visible wall-clock time. Latency = visible_time - send_ack_time.
 Reports P50/P95/P99 and writes demo-api/.freshness.json for GET /freshness.
 
 Requires the stack up (make up) and the flattener job running (make submit-job).
@@ -71,9 +71,16 @@ def main() -> int:
                 "result": "PASS", "measuredAt": iso(now),
             }],
         }
+        # Record the produce time in the delivery callback, when the broker acknowledges
+        # the send, rather than right after produce() (which only enqueues into the local
+        # buffer). Recording it here would cluster every timestamp near flush and make the
+        # percentiles understate true latency. The default arg binds this event_id.
+        def _on_delivery(err, _msg, event_id=event_id):
+            if err is None:
+                produced_at[event_id] = time.time()
+
         producer.produce(args.topic, key=envelope["messageId"].encode(),
-                         value=json.dumps(envelope).encode())
-        produced_at[event_id] = now
+                         value=json.dumps(envelope).encode(), on_delivery=_on_delivery)
         if i % 500 == 0:
             producer.poll(0)
     producer.flush(30)

@@ -33,5 +33,10 @@ sinks:
   audit: "mdp.audit"
 
 runtime:
-  checkpoint_ms: 10000          # Iceberg commits on checkpoint -> visibility cadence
+  # Iceberg commits on checkpoint completion, so this interval is the freshness cadence.
+  # 5000 ms holds P95 end to end freshness under 10 seconds. Tradeoff: a shorter commit
+  # interval lands data sooner but writes more, smaller Iceberg files. Compacting those
+  # files and other table maintenance belong to the team that owns the sink tables, not
+  # to this processor.
+  checkpoint_ms: 5000
   parallelism: 1                # single writer per table (hard constraint)
