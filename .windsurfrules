@@ -1,0 +1,33 @@
+# Windsurf rules — SPaaS MDP flattener harness
+
+This repo is a local proof of concept: Kafka -> Flink (DataStream flattener) -> Iceberg on
+S3 (MinIO plus a REST catalog) -> Trino. It flattens nested manufacturing test events into
+one flat row per event. All data is synthetic.
+
+## Read these first
+- RUNBOOK.md : exactly how to run and test (start here for any run or test task).
+- README.md : architecture and quick start.
+- NOTES.md : per milestone build log with verification output.
+- context.txt : short project overview, accomplishments, and learnings.
+
+## The test gate (run before and after every change)
+- Fast: `bash scripts/test.sh` (JUnit in Docker, no host Gradle). Expect BUILD SUCCESSFUL
+  and 29 passing tests.
+- Full: `bash scripts/test.sh integration` (Testcontainers, slow). Expect
+  `[IT] FINAL flattened=7 quarantine=2 audit=1`.
+
+## Hard rules (do not break)
+- Keep the two transform contracts: deterministic output, and never throw on a bad record
+  (bad input becomes a quarantine record, never a crash).
+- Do not change the version matrix (`processor/versions.gradle`, `docker/.env`), the docker
+  compose stack, or the Kafka, Iceberg, or Trino wiring.
+- Keep the Java package `com.example` (a privacy scrub; this repo is public).
+- Scope is the manufacturing flattener only. No generic plugin system or transform registry.
+- Work incrementally: one change, update its test, run `bash scripts/test.sh` to green.
+
+## Notes
+- Builds and tests run inside Docker (`gradle:8.10-jdk17`); you do not need host Gradle or a JDK.
+- `make submit-job` is detached (`flink run -d`); it returns immediately and the job keeps
+  running, so do not wait on it.
+- A single `make freshness` burst is one commit window sample; the honest freshness claim is
+  P95 under 10 seconds, bounded by the 5 second commit interval (`runtime.checkpoint_ms`).
