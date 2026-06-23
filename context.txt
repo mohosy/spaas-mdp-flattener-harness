@@ -1,0 +1,103 @@
+SPaaS MDP Flattener Harness — Project Context
+=============================================
+
+Last updated: 2026-06-23
+
+WHAT THIS IS
+------------
+A local, runnable proof of concept of a streaming data service that flattens nested
+manufacturing test events into flat, queryable rows. The whole pipeline runs on open
+source components that speak the same wire protocols as the production target, so the
+same Iceberg tables can later point at the real systems without changing the processor.
+
+Data flow:
+  Kafka (envelopes)  ->  Flink (DataStream flattener)  ->  Iceberg on S3 (MinIO + REST
+  catalog)  ->  Trino (external SQL engine).
+
+All data here is synthetic. The manufacturing schema is isolated behind one config file
+(config/field-mapping.yaml), so the real event shape is a configuration swap, not a code
+change. The Java package stays com.example on purpose (a privacy scrub for this repo).
+
+WHAT WE ARE BUILDING
+--------------------
+A manufacturing measurement (MDP) flattener: one envelope message carries many test
+events, and the flattener emits exactly one flat row per event with business columns plus
+lineage (source topic, partition, offset, hashes, processor version, processed at). It
+deduplicates within a message by a canonical row hash, routes bad records to a quarantine
+table instead of crashing, and writes a per commit audit row. The goal of this phase is
+one specific thing done well, flattening manufacturing events correctly, rather than a
+general purpose stream processing platform.
+
+WHAT WE ACCOMPLISHED THIS PHASE
+-------------------------------
+1. Four real transform operations, configuration driven in field-mapping.yaml:
+   - Fallback chain (coalesce): the first source that is present and not null wins.
+   - Array reduce: MAX or MIN over named numeric entries (for example UL and LL) inside an
+     array of {name, value} objects, comparing names ignoring case and skipping values
+     that are not numbers.
+   - Numeric and string split: one source string goes to a numeric column when it parses
+     as a decimal, otherwise to a string column (text is kept, never quarantined).
+   - Multi format timestamp: the first accepted format wins (ISO 8601, then MM/dd/yyyy,
+     then yyyy-MM-dd), else null.
+   Operations are typed, self validating records, so a misconfigured mapping fails fast on
+   load. They are proven by unit tests on the flattener output; the live flattened schema
+   is unchanged.
+
+2. Durable, commit aligned audit window:
+   The audit counters (input, output, quarantine, dedup, and per partition offset min and
+   max) now live in Flink operator managed state, so they survive a checkpoint and a
+   restart. Each audit row lines up with a checkpoint and the Iceberg commit it produces,
+   and carries the committed snapshot id.
+
+3. Freshness:
+   The commit interval is now 5 seconds, which holds P95 end to end freshness under 10
+   seconds. The freshness probe was corrected to record produce time when the broker
+   acknowledges the send, so latency starts when the message is actually sent.
+
+VERIFICATION
+------------
+- 29 unit tests pass (hashing, mapping parsing and validation, the four operations,
+  determinism, dedup, quarantine).
+- The Testcontainers integration test passes end to end on ephemeral Kafka, MinIO, and an
+  Iceberg REST catalog: 7 good rows flattened, 2 bad rows quarantined, audit written, with
+  the audit committed one checkpoint after the data it describes.
+- A live run on the full stack confirmed freshness bounded by the 5 second commit interval
+  (observed roughly 2.9 to 5.3 seconds across bursts, comfortably under 10 seconds) and the
+  managed state audit row emitting on the real cluster with a real snapshot id.
+
+WHAT WE LEARNED
+---------------
+- Two transform contracts matter most: deterministic output (identical input always yields
+  identical rows and hashes) and never throwing on a bad record (bad input becomes a
+  quarantine record, never a crash).
+- Audit counters belong in managed state, but they should be sealed at the checkpoint and
+  the running window reset, because a restart rewinds the source and reprocesses the
+  records, so persisting a partial window would double count it.
+- A Flink function cannot emit downstream records from snapshotState or
+  notifyCheckpointComplete, so a timer that registers itself again on each fire flushes the
+  audit row. This also keeps a bounded run (produce once, then idle) from starving.
+- Freshness is dominated by the wait for the next Iceberg commit, so it is bounded by the
+  commit interval. A one shot burst lands in a single commit window and reports a single
+  sample (near identical percentiles are the tell). A true distribution needs sustained
+  rate production across many commit cycles.
+- Scope discipline paid off: implement exactly the four operations this model needs, not a
+  generic plugin system or transform registry.
+
+STATUS AND WHAT IS NEXT
+-----------------------
+The flattener is built, proven correct by tests, and proven fast by a live run on
+synthetic data. The remaining finish line is parity against the existing system on real
+data: map the real field names into field-mapping.yaml and confirm the flattener produces
+the same result per measurement once real field names and data access are available. The
+processor and job wiring do not change for that, only configuration does.
+
+REPO LAYOUT (pointers)
+----------------------
+  processor/   Java 17 Flink module (api, transform/mdp, lineage, job, config) plus tests
+  config/      job.yaml (one job config) plus field-mapping.yaml (the schema mapping)
+  docker/      compose stack plus pinned image versions
+  scripts/     build, submit, freshness, and test helpers plus the table DDL
+  generator/   synthetic event generator
+  demo-api/    FastAPI read API (queries through Trino)
+  README.md    architecture and quick start
+  NOTES.md     per milestone build log with verification output (M7 and M8 cover this phase)
